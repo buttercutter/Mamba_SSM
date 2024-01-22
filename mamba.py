@@ -248,6 +248,7 @@ class MambaBlock(nn.Module):
 
         if attention_mask is not None:
             # Apply the attention mask
+            #print(f"Inside Mamba_block, x.shape = {x.shape}, attention_mask.shape = {attention_mask.shape}")
             x = x * attention_mask.unsqueeze(-1)
 
         """
@@ -302,18 +303,34 @@ class Mamba(nn.Module):
         if vocab_size is None:
             vocab_size = d_model
 
+        # Linear layer versus Embedding layer
+        # Functionality: nn.Linear() is a general-purpose linear transformation layer, while
+        #                nn.Embedding() is specifically designed for embedding lookups.
+        # Input Type: nn.Linear() accepts continuous input data, whereas
+        #             nn.Embedding() expects discrete input data (typically indices).
+        # nn.Linear() is used for transforming data linearly, while
+        # nn.Embedding() is used for mapping discrete data (like words or item IDs) to vectors in a continuous space.
+        # embedding_dim is the size of the embedding vectors (MAMBA model's D)
+        # This will change incoming input from shape [B, L] to [B, L, D]
+        self.embedding_layer = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model, device=device)
+
+        # All three Mamba blocks are operating at a downsized dimension of `d_model` instead of `vocab_size`
         self.mamba_block1 = MambaBlock(seq_len, d_model, state_size, device)
         self.mamba_block2 = MambaBlock(seq_len, d_model, state_size, device)
         self.mamba_block3 = MambaBlock(seq_len, d_model, state_size, device)
 
-        self.final_proj = nn.Linear(d_model, vocab_size, device=device)
+        self.up_proj = nn.Linear(d_model, vocab_size, device=device)
 
     def forward(self, x, attention_mask=None):
+        #print(f"Before nn.embedding(), x.shape = {x.shape}")
+        x = self.embedding_layer(x.type(torch.long)).type(torch.float32)
+        #print(f"After nn.embedding(), x.shape = {x.shape}")
+
         x = self.mamba_block1(x, attention_mask)
         x = self.mamba_block2(x, attention_mask)
         x = self.mamba_block3(x, attention_mask)
 
-        x = self.final_proj(x)
+        x = self.up_proj(x)
 
         return x
 
@@ -337,16 +354,12 @@ class RMSNorm(nn.Module):
 # Example usage:
 # Create a random input tensor
 if USE_MAMBA:
-    x = torch.rand(batch_size, seq_len, d_model, device=device)
+    x = torch.rand(batch_size, seq_len, device=device)
     # Create the Mamba model
     mamba = Mamba(seq_len, d_model, state_size, None, device)
 
-    # rmsnorm
-    norm = RMSNorm(d_model)
-    x = norm(x)
-
     # Forward pass
-    test_output = mamba(x)
+    test_output = mamba(x.type(torch.long))
     print(f"test_output.shape = {test_output.shape}")  # Should be [batch_size, seq_len, d_model]
 
 
@@ -395,8 +408,7 @@ def train(model, tokenizer, data_loader, optimizer, criterion, device, max_grad_
     for batch in data_loader:
         optimizer.zero_grad()
 
-        original_data = batch['input_ids'].clone().to(device)  # data without downsized dimension
-        input_data = batch['encoded_inputs'].clone().to(device)  # data with downsized dimension for Mamba model
+        input_data = batch['encoded_inputs'].clone().to(device)  # data without downsized dimension for Mamba model
         attention_mask = batch['attention_mask'].clone().to(device)
 
         # In most sequence modeling tasks, like language modeling, the target should be the next token
@@ -404,7 +416,7 @@ def train(model, tokenizer, data_loader, optimizer, criterion, device, max_grad_
         # This is because the model's goal is to predict the next word given the previous words.
         # Shift the input data by one position to get the target, so that each target token
         # is the next token following the input token.
-        target = original_data[:, 1:]
+        target = input_data[:, 1:]
         input_data = input_data[:, :-1]
 
         #print("Before padding: ")
@@ -413,7 +425,7 @@ def train(model, tokenizer, data_loader, optimizer, criterion, device, max_grad_
 
         # Pad all the sequences in the batch:
         input_data = pad_sequences_3d(input_data, pad_value=tokenizer.pad_token_id)
-        target = pad_sequences_3d(target, max_len=original_data.size(1), pad_value=tokenizer.pad_token_id)
+        target = pad_sequences_3d(target, max_len=input_data.size(1), pad_value=tokenizer.pad_token_id)
 
         #print("After padding: ")
         #print(f"target.shape = {target.shape}")
@@ -425,6 +437,10 @@ def train(model, tokenizer, data_loader, optimizer, criterion, device, max_grad_
         #print(f"Output shape: {output.shape}")
         #print(f"Target shape: {target.shape}")
 
+        # Ensure the target tensor is of type long
+        target = target.long()
+
+        # Compute the loss
         loss = criterion(output.view(-1, vocab_size), target.view(-1))
 
         loss.backward(retain_graph=True)
@@ -464,8 +480,7 @@ def evaluate(model, data_loader, criterion, device, DEBUGGING_IS_ON=False):
     total_loss = 0
     with torch.no_grad():
         for batch in data_loader:
-            original_data = batch['input_ids'].clone().to(device)  # data without downsized dimension
-            input_data = batch['encoded_inputs'].clone().detach().to(device)  # data with downsized dimension for Mamba model
+            input_data = batch['encoded_inputs'].clone().detach().to(device)  # data without downsized dimension for Mamba model
             attention_mask = batch['attention_mask'].clone().detach().to(device)
 
             # In most sequence modeling tasks, like language modeling, the target should be the next token
@@ -473,7 +488,7 @@ def evaluate(model, data_loader, criterion, device, DEBUGGING_IS_ON=False):
             # This is because the model's goal is to predict the next word given the previous words.
             # Shift the input data by one position to get the target, so that each target token
             # is the next token following the input token.
-            target = original_data[:, 1:]
+            target = input_data[:, 1:]
             input_data = input_data[:, :-1]
 
             #print("Before padding: ")
@@ -482,7 +497,7 @@ def evaluate(model, data_loader, criterion, device, DEBUGGING_IS_ON=False):
 
             # Pad all the sequences in the batch:
             input_data = pad_sequences_3d(input_data, pad_value=tokenizer.pad_token_id)
-            target = pad_sequences_3d(target, max_len=original_data.size(1), pad_value=tokenizer.pad_token_id)
+            target = pad_sequences_3d(target, max_len=input_data.size(1), pad_value=tokenizer.pad_token_id)
 
             #print("After padding: ")
             #print(f"target.shape = {target.shape}")
@@ -494,6 +509,10 @@ def evaluate(model, data_loader, criterion, device, DEBUGGING_IS_ON=False):
             #print(f"Output shape: {output.shape}")
             #print(f"Target shape: {target.shape}")
 
+            # Ensure the target tensor is of type long
+            target = target.long()
+
+            # Compute the loss
             loss = criterion(output.view(-1, vocab_size), target.view(-1))
 
             total_loss += loss.item()
@@ -509,7 +528,6 @@ def calculate_perplexity(loss):
     return math.exp(loss)
 
 def load_enwiki8_dataset():
-    print(f"Download and extract enwiki8 data")
     url = "http://mattmahoney.net/dc/enwik8.zip"
     urllib.request.urlretrieve(url, "enwik8.zip")
 
@@ -539,59 +557,19 @@ def encode_dataset(tokenizer, text_data):
     vocab_size = len(tokenizer.vocab)  # Note that for some tokenizers, we might access the vocab directly
     print(f"vocab_size = {vocab_size}")
 
-    # Create an embedding layer
-    # embedding_dim is the size of the embedding vectors (MAMBA model's D)
-    embedding_layer = nn.Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
-
-    # Pass `input_ids` through the embedding layer
-    # This will change `input_ids` from shape [B, L] to [B, L, D]
-    #encoded_inputs = embedding_layer(input_ids)   ## this eats memory, so use batched_embedding_calls instead
-    def batch_embedding_calls(input_ids, embedding_layer, batch_size=256):
-        # Check if input_ids is already a tensor, if not convert it
-        if not isinstance(input_ids, torch.Tensor):
-            input_ids = torch.tensor(input_ids, dtype=torch.long)
-
-        # Calculate the number of batches needed
-        num_batches = math.ceil(input_ids.size(0) / batch_size)
-
-        # List to hold the output embeddings
-        output_embeddings = []
-
-        # Process each batch
-        for i in range(num_batches):
-            # Calculate start and end indices for the current batch
-            start_idx = i * batch_size
-            end_idx = start_idx + batch_size
-
-            # Get the batch
-            input_id_batch = input_ids[start_idx:end_idx]
-
-            # Call the embedding layer
-            with torch.no_grad():  # No need gradients for this operation
-                batch_embeddings = embedding_layer(input_id_batch)
-
-            # Append the result to the list
-            output_embeddings.append(batch_embeddings)
-
-        # Concatenate the embeddings from each batch into a single tensor
-        all_embeddings = torch.cat(output_embeddings, dim=0)
-
-        return all_embeddings
-
-    # `input_ids` is a list or tensor of the input IDs and `embedding_layer` is model's embedding layer
+    # `input_ids` is a list or tensor of the input IDs
     if USE_MAMBA:
-        # Set `batch_size` to a value that works for memory constraints
-        # batch_embedding_calls() is very slow, not suitable to implement directly during forward pass
-        encoded_inputs = batch_embedding_calls(input_ids, embedding_layer, batch_size=1).float()
+        encoded_inputs = input_ids.float()  # Cast input_ids to float because there are floating point ops inside Mamba model
 
     elif USE_TRANSFORMER:
         encoded_inputs = input_ids.long()  # Cast input_ids to long if necessary
 
-    attention_mask = (input_ids != tokenizer.pad_token_id).type(input_ids.dtype)
+    # must compare with raw `input_ids` instead of tokenized `encoded_inputs`
+    attention_mask = (input_ids != tokenizer.pad_token_id).type(encoded_inputs.dtype)
     #print(f"attention_mask.shape = {attention_mask.shape}")
     #print(f"encoded_inputs.shape = {encoded_inputs.shape}")
 
-    return encoded_inputs, attention_mask, input_ids
+    return encoded_inputs, attention_mask
 
 
 # Load a pretrained tokenizer
@@ -612,16 +590,16 @@ if os.path.exists(encoded_inputs_file):
     print("Loading pre-tokenized data...")
     encoded_inputs = torch.load(encoded_inputs_file)
 else:
-    print("Tokenizing raw data...")
+    print(f"Download and extract enwiki8 data")
     enwiki8_data = load_enwiki8_dataset()
-    encoded_inputs, attention_mask, input_ids = encode_dataset(tokenizer, enwiki8_data)
+    print("Tokenizer in action ...")
+    encoded_inputs, attention_mask = encode_dataset(tokenizer, enwiki8_data)
     torch.save(encoded_inputs, encoded_inputs_file)
     print(f"finished tokenizing data")
 
 
 # Combine into a single dictionary
 data = {
-    'input_ids': input_ids,
     'encoded_inputs': encoded_inputs,
     'attention_mask': attention_mask
 }
@@ -670,7 +648,7 @@ elif USE_TRANSFORMER:
 
 # Define the loss function and optimizer
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=5e-3)
+optimizer = optim.AdamW(model.parameters(), lr=1e-3)
 
 # Training loop
 num_epochs = 25  # Number of epochs to train for
